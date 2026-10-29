@@ -118,7 +118,7 @@ from this file. See [docs/factory-board.md](docs/factory-board.md).
 pnpm install
 
 # Build
-pnpm build
+pnpm sdk:build
 
 # Test locally
 pnpm dev add vercel-labs/agent-skills --list
@@ -167,7 +167,7 @@ CI will fail if code is not properly formatted.
 ```bash
 # 1. Bump version in package.json
 # 2. Build
-pnpm build
+pnpm sdk:build
 # 3. Publish
 npm publish
 ```

@@ -74,35 +74,54 @@ export async function hasSkillMd(dir: string): Promise<boolean> {
   }
 }
 
-function warnSkippedSkill(skillMdPath: string, reason: string): void {
-  console.warn(`⚠ Skipped ${sanitizeMetadata(skillMdPath)} — ${stripTerminalEscapes(reason)}`);
+function warnSkippedSkill(
+  skillMdPath: string,
+  reason: string,
+  onWarning: (message: string) => void = console.warn
+): void {
+  onWarning(`⚠ Skipped ${sanitizeMetadata(skillMdPath)} — ${stripTerminalEscapes(reason)}`);
 }
 
 export async function parseSkillMd(
   skillMdPath: string,
-  options?: { includeInternal?: boolean }
+  options?: { includeInternal?: boolean; onWarning?: (message: string) => void }
 ): Promise<Skill | null> {
   let content: string;
   try {
     content = await readFile(skillMdPath, 'utf-8');
   } catch (err) {
-    warnSkippedSkill(skillMdPath, `failed to read file: ${(err as Error).message}`);
+    warnSkippedSkill(
+      skillMdPath,
+      `failed to read file: ${(err as Error).message}`,
+      options?.onWarning
+    );
     return null;
   }
 
-  let data: Record<string, unknown>;
+  let data: Record<string, unknown> | undefined;
+  const warnings: string[] = [];
+  const onWarning = options?.onWarning
+    ? (message: string) => {
+        warnings.push(message);
+      }
+    : undefined;
   try {
-    ({ data } = parseFrontmatter(content));
+    ({ data } = parseFrontmatter(content, { onWarning }));
   } catch (err) {
-    warnSkippedSkill(skillMdPath, `YAML parse error: ${(err as Error).message}`);
-    return null;
+    warnSkippedSkill(skillMdPath, `YAML parse error: ${(err as Error).message}`, onWarning);
   }
+  for (const warning of warnings) options?.onWarning?.(warning);
+  if (data === undefined) return null;
 
   if (!data.name || !data.description) {
     const missing: string[] = [];
     if (!data.name) missing.push('name');
     if (!data.description) missing.push('description');
-    warnSkippedSkill(skillMdPath, `missing required frontmatter field(s): ${missing.join(', ')}`);
+    warnSkippedSkill(
+      skillMdPath,
+      `missing required frontmatter field(s): ${missing.join(', ')}`,
+      options?.onWarning
+    );
     return null;
   }
 
@@ -110,7 +129,8 @@ export async function parseSkillMd(
   if (typeof data.name !== 'string' || typeof data.description !== 'string') {
     warnSkippedSkill(
       skillMdPath,
-      `frontmatter "name" and "description" must be strings (got ${typeof data.name} and ${typeof data.description})`
+      `frontmatter "name" and "description" must be strings (got ${typeof data.name} and ${typeof data.description})`,
+      options?.onWarning
     );
     return null;
   }
@@ -158,6 +178,8 @@ async function findSkillDirs(dir: string, depth = 0, maxDepth = 5): Promise<stri
 }
 
 export interface DiscoverSkillsOptions {
+  /** Override diagnostic output; messages can include source snippets. */
+  onWarning?: (message: string) => void;
   /** Include internal skills (e.g., when user explicitly requests a skill by name) */
   includeInternal?: boolean;
   /** Search all subdirectories even when a root SKILL.md exists */
@@ -300,23 +322,19 @@ export async function discoverSkills(
   };
 
   const walkSkillDirs = async (dir: string, maxDepth: number, depth = 1): Promise<void> => {
-    try {
-      const entries = await readdir(dir, { withFileTypes: true });
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
 
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
 
-        const childDir = join(dir, entry.name);
-        const foundAtChild = await tryAddSkillAt(childDir);
+      const childDir = join(dir, entry.name);
+      const foundAtChild = await tryAddSkillAt(childDir);
 
-        // Preserve flat-layout semantics by stopping below a discovered
-        // skill, and never descend through ignored directories.
-        if (foundAtChild || depth >= maxDepth || SKIP_DIRS.includes(entry.name)) continue;
+      // Preserve flat-layout semantics by stopping below a discovered
+      // skill, and never descend through ignored directories.
+      if (foundAtChild || depth >= maxDepth || SKIP_DIRS.includes(entry.name)) continue;
 
-        await walkSkillDirs(childDir, maxDepth, depth + 1);
-      }
-    } catch {
-      // Directory doesn't exist or is unreadable; skip silently.
+      await walkSkillDirs(childDir, maxDepth, depth + 1);
     }
   };
 

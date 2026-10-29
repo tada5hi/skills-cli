@@ -17,6 +17,57 @@ Supports **OpenCode**, **Claude Code**, **Codex**, **Cursor**, and [75 more](doc
   <a href="https://skills.sh/vercel-labs/skills"><img alt="skills.sh" src="https://skills.sh/b/vercel-labs/skills?style=for-the-badge" height="28"></a>
 </p>
 
+## Temporary headless SDK fork
+
+This fork exposes the existing discovery and installation functions for preparation tools.
+Use Node.js 22.20 or later and pin the dependency to a full reviewed commit:
+
+```json
+{
+  "devDependencies": {
+    "skills": "git+https://github.com/tada5hi/skills-cli.git#<full-commit-sha>"
+  }
+}
+```
+
+The pinned fork includes generated `dist` files and needs no install-time build scripts.
+Maintainers regenerate them with `pnpm sdk:build`. The custom script name avoids npm
+Git dependency preparation installing development dependencies, even with scripts disabled.
+The root entry exports the existing APIs for source parsing, Git, skill discovery and
+frontmatter, installation and listing, agents, plugin manifests, and host providers,
+plus their public TypeScript types. CLI command handlers and telemetry stay internal;
+importing the root entry does not run the CLI or start telemetry.
+
+`RemoteSkill` is the installer's remote skill type, including `providerId` and
+`sourceIdentifier`. `ProviderRemoteSkill` is the provider's fetched skill type.
+
+```ts
+import { discoverSkills, filterSkills, installSkillForAgent } from 'skills';
+
+const skills = await discoverSkills('/absolute/path/to/source');
+const requestedNames = ['my-skill'];
+for (const name of requestedNames) {
+  if (filterSkills(skills, [name]).length === 0) throw new Error(`Skill not found: ${name}`);
+}
+const selected = filterSkills(skills, requestedNames);
+for (const skill of selected) {
+  const result = await installSkillForAgent(skill, 'universal', {
+    cwd: '/absolute/path/to/project',
+    global: false,
+    mode: 'copy',
+  });
+  if (!result.success) throw new Error(result.error);
+}
+```
+
+These are upstream implementations with their existing behavior: callers must validate
+requested names, inspect install results and clean cloned repositories with `cleanupTempDir`.
+To suppress parser diagnostics that may include source snippets, pass `onWarning: () => {}`
+to `discoverSkills` in its options argument. Exceptions thrown by a supplied callback
+reject discovery unchanged.
+The CLI remains available. Migration to an official SDK release is tracked in
+[Chamvi issue 97](https://github.com/chamvi/chamvi/issues/97).
+
 ## Install a Skill
 
 Requires Node.js 22.20 or later. Run this from your project:

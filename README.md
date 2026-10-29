@@ -31,6 +31,8 @@ Use Node.js 22.20 or later and pin the dependency to a full reviewed commit:
 ```
 
 The pinned fork includes generated `dist` files and needs no install-time build scripts.
+Maintainers regenerate them with `pnpm sdk:build`. The custom script name avoids npm
+Git dependency preparation installing development dependencies, even with scripts disabled.
 It exports `parseSource`, `cloneRepo`, `cleanupTempDir`, `discoverSkills`, `filterSkills`
 and `installSkillForAgent`, plus their existing TypeScript types. Importing the root
 entry does not run the CLI or start telemetry.

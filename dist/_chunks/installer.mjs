@@ -900,33 +900,33 @@ async function hasSkillMd(dir) {
 		return false;
 	}
 }
-function warnSkippedSkill(skillMdPath, reason) {
-	console.warn(`⚠ Skipped ${sanitizeMetadata(skillMdPath)} — ${stripTerminalEscapes(reason)}`);
+function warnSkippedSkill(skillMdPath, reason, onWarning = console.warn) {
+	onWarning(`⚠ Skipped ${sanitizeMetadata(skillMdPath)} — ${stripTerminalEscapes(reason)}`);
 }
 async function parseSkillMd(skillMdPath, options) {
 	let content;
 	try {
 		content = await readFile(skillMdPath, "utf-8");
 	} catch (err) {
-		warnSkippedSkill(skillMdPath, `failed to read file: ${err.message}`);
+		warnSkippedSkill(skillMdPath, `failed to read file: ${err.message}`, options?.onWarning);
 		return null;
 	}
 	let data;
 	try {
 		({data} = parseFrontmatter(content));
 	} catch (err) {
-		warnSkippedSkill(skillMdPath, `YAML parse error: ${err.message}`);
+		warnSkippedSkill(skillMdPath, `YAML parse error: ${err.message}`, options?.onWarning);
 		return null;
 	}
 	if (!data.name || !data.description) {
 		const missing = [];
 		if (!data.name) missing.push("name");
 		if (!data.description) missing.push("description");
-		warnSkippedSkill(skillMdPath, `missing required frontmatter field(s): ${missing.join(", ")}`);
+		warnSkippedSkill(skillMdPath, `missing required frontmatter field(s): ${missing.join(", ")}`, options?.onWarning);
 		return null;
 	}
 	if (typeof data.name !== "string" || typeof data.description !== "string") {
-		warnSkippedSkill(skillMdPath, `frontmatter "name" and "description" must be strings (got ${typeof data.name} and ${typeof data.description})`);
+		warnSkippedSkill(skillMdPath, `frontmatter "name" and "description" must be strings (got ${typeof data.name} and ${typeof data.description})`, options?.onWarning);
 		return null;
 	}
 	const metadata = isRecord(data.metadata) ? data.metadata : void 0;

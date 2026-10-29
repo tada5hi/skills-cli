@@ -28,6 +28,8 @@ declare function parseSource(input: string, options?: {
 declare function cloneRepo(url: string, ref?: string): Promise<string>;
 declare function cleanupTempDir(dir: string): Promise<void>;
 interface DiscoverSkillsOptions {
+  /** Override console.warn; diagnostics can include source snippets. */
+  onWarning?: (message: string) => void;
   /** Include internal skills (e.g., when user explicitly requests a skill by name) */
   includeInternal?: boolean;
   /** Search all subdirectories even when a root SKILL.md exists */

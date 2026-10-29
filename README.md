@@ -54,6 +54,8 @@ for (const skill of selected) {
 
 These are upstream implementations with their existing behavior: callers must validate
 requested names, inspect install results and clean cloned repositories with `cleanupTempDir`.
+To suppress parser diagnostics that may include source snippets, pass `onWarning: () => {}`
+to `discoverSkills` in its options argument.
 The CLI remains available. Migration to an official SDK release is tracked in
 [Chamvi issue 97](https://github.com/chamvi/chamvi/issues/97).
 

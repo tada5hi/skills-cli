@@ -74,19 +74,27 @@ export async function hasSkillMd(dir: string): Promise<boolean> {
   }
 }
 
-function warnSkippedSkill(skillMdPath: string, reason: string): void {
-  console.warn(`⚠ Skipped ${sanitizeMetadata(skillMdPath)} — ${stripTerminalEscapes(reason)}`);
+function warnSkippedSkill(
+  skillMdPath: string,
+  reason: string,
+  onWarning: (message: string) => void = console.warn
+): void {
+  onWarning(`⚠ Skipped ${sanitizeMetadata(skillMdPath)} — ${stripTerminalEscapes(reason)}`);
 }
 
 export async function parseSkillMd(
   skillMdPath: string,
-  options?: { includeInternal?: boolean }
+  options?: { includeInternal?: boolean; onWarning?: (message: string) => void }
 ): Promise<Skill | null> {
   let content: string;
   try {
     content = await readFile(skillMdPath, 'utf-8');
   } catch (err) {
-    warnSkippedSkill(skillMdPath, `failed to read file: ${(err as Error).message}`);
+    warnSkippedSkill(
+      skillMdPath,
+      `failed to read file: ${(err as Error).message}`,
+      options?.onWarning
+    );
     return null;
   }
 
@@ -94,7 +102,11 @@ export async function parseSkillMd(
   try {
     ({ data } = parseFrontmatter(content));
   } catch (err) {
-    warnSkippedSkill(skillMdPath, `YAML parse error: ${(err as Error).message}`);
+    warnSkippedSkill(
+      skillMdPath,
+      `YAML parse error: ${(err as Error).message}`,
+      options?.onWarning
+    );
     return null;
   }
 
@@ -102,7 +114,11 @@ export async function parseSkillMd(
     const missing: string[] = [];
     if (!data.name) missing.push('name');
     if (!data.description) missing.push('description');
-    warnSkippedSkill(skillMdPath, `missing required frontmatter field(s): ${missing.join(', ')}`);
+    warnSkippedSkill(
+      skillMdPath,
+      `missing required frontmatter field(s): ${missing.join(', ')}`,
+      options?.onWarning
+    );
     return null;
   }
 
@@ -110,7 +126,8 @@ export async function parseSkillMd(
   if (typeof data.name !== 'string' || typeof data.description !== 'string') {
     warnSkippedSkill(
       skillMdPath,
-      `frontmatter "name" and "description" must be strings (got ${typeof data.name} and ${typeof data.description})`
+      `frontmatter "name" and "description" must be strings (got ${typeof data.name} and ${typeof data.description})`,
+      options?.onWarning
     );
     return null;
   }
@@ -158,6 +175,8 @@ async function findSkillDirs(dir: string, depth = 0, maxDepth = 5): Promise<stri
 }
 
 export interface DiscoverSkillsOptions {
+  /** Override console.warn; diagnostics can include source snippets. */
+  onWarning?: (message: string) => void;
   /** Include internal skills (e.g., when user explicitly requests a skill by name) */
   includeInternal?: boolean;
   /** Search all subdirectories even when a root SKILL.md exists */

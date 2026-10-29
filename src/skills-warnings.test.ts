@@ -45,18 +45,89 @@ describe('per-call skill warnings', () => {
     expect(output).toContain('cli-fixture-token');
   });
 
+  it('preserves default nonfatal YAML process warnings', async () => {
+    const root = await fixture(
+      '---\nname: tagged\ndescription: !unknown default-tag-fixture\n---\n'
+    );
+    const warning = vi.spyOn(process, 'emitWarning').mockImplementation(() => {});
+    const consoleWarning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(await discoverSkills(root)).toHaveLength(1);
+    expect(warning).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        message: expect.stringContaining('default-tag-fixture'),
+      })
+    );
+    expect(consoleWarning).not.toHaveBeenCalled();
+  });
+
+  it('preserves CLI discovery of unknown tags without a callback', async () => {
+    const root = await fixture('---\nname: tagged\ndescription: !unknown cli-tag-fixture\n---\n');
+
+    const result = runCli(['add', root, '--list']);
+    const output = result.stdout + result.stderr;
+    expect(result.exitCode).toBe(0);
+    expect(output).toContain('Found 1 skill');
+    expect(output).toContain('cli-tag-fixture');
+  });
+
+  it('routes nonfatal YAML warnings per call and supports a quiet no-op callback', async () => {
+    const root = await fixture(
+      '---\nname: tagged\ndescription: !unknown private-tag-fixture\n---\n'
+    );
+    const warning = vi.spyOn(process, 'emitWarning').mockImplementation(() => {});
+    const consoleWarning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const onWarning = vi.fn();
+
+    expect(await discoverSkills(root, undefined, { onWarning })).toHaveLength(1);
+    expect(onWarning).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining('private-tag-fixture')
+    );
+    expect(await discoverSkills(root, undefined, { onWarning: () => {} })).toHaveLength(1);
+    expect(warning).not.toHaveBeenCalled();
+    expect(consoleWarning).not.toHaveBeenCalled();
+  });
+
+  it('isolates concurrent callback and default nonfatal YAML warnings', async () => {
+    const quietRoot = await fixture(
+      '---\nname: quiet\ndescription: !unknown quiet-tag-fixture\n---\n'
+    );
+    const defaultRoot = await fixture(
+      '---\nname: default\ndescription: !unknown loud-tag-fixture\n---\n'
+    );
+    const warning = vi.spyOn(process, 'emitWarning').mockImplementation(() => {});
+    const consoleWarning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const onWarning = vi.fn();
+
+    const results = await Promise.all([
+      discoverSkills(quietRoot, undefined, { onWarning }),
+      discoverSkills(defaultRoot),
+    ]);
+    expect(results.map((skills) => skills.length)).toEqual([1, 1]);
+    expect(onWarning).toHaveBeenCalledExactlyOnceWith(expect.stringContaining('quiet-tag-fixture'));
+    expect(warning).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        message: expect.stringContaining('loud-tag-fixture'),
+      })
+    );
+    expect(String(warning.mock.calls[0]![0])).not.toContain('quiet-tag-fixture');
+    expect(consoleWarning).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['YAML parse error:', malformed('callback-fixture-token')],
     ['missing required frontmatter field(s):', '---\nname: missing-description\n---\n'],
     ['must be strings', '---\nname: 123\ndescription: invalid-name\n---\n'],
   ])('routes %s through the parser callback', async (diagnostic, content) => {
     const root = await fixture(content);
+    const processWarning = vi.spyOn(process, 'emitWarning').mockImplementation(() => {});
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const onWarning = vi.fn();
 
     expect(await parseSkillMd(join(root, 'SKILL.md'), { onWarning })).toBeNull();
     expect(onWarning).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(diagnostic));
     expect(warning).not.toHaveBeenCalled();
+    expect(processWarning).not.toHaveBeenCalled();
   });
 
   it('routes unreadable-file diagnostics through the parser callback', async () => {

@@ -6,7 +6,7 @@ import { homedir, platform, tmpdir } from "os";
 import { promisify } from "util";
 import { execFile } from "child_process";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from "fs/promises";
-import { parse, stringify } from "yaml";
+import { parse, parseDocument, stringify } from "yaml";
 import { createHash } from "crypto";
 const DEFAULT_GITHUB_HOST = "github.com";
 function getGitHubHost() {
@@ -609,14 +609,22 @@ async function cleanupTempDir(dir) {
 		force: true
 	});
 }
-function parseFrontmatter(raw) {
+function parseFrontmatter(raw, options) {
 	const match = raw.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
 	if (!match) return {
 		data: {},
 		content: raw
 	};
+	let parsed;
+	if (options?.onWarning) {
+		const document = parseDocument(match[1]);
+		for (const warning of document.warnings) options.onWarning(warning.message);
+		if (document.errors.length > 0) throw document.errors[0];
+		document.options.logLevel = "silent";
+		parsed = document.toJS();
+	} else parsed = parse(match[1]);
 	return {
-		data: parse(match[1]) ?? {},
+		data: parsed ?? {},
 		content: match[2] ?? ""
 	};
 }
@@ -913,7 +921,7 @@ async function parseSkillMd(skillMdPath, options) {
 	}
 	let data;
 	try {
-		({data} = parseFrontmatter(content));
+		({data} = parseFrontmatter(content, options));
 	} catch (err) {
 		warnSkippedSkill(skillMdPath, `YAML parse error: ${err.message}`, options?.onWarning);
 		return null;

@@ -100,7 +100,7 @@ export async function parseSkillMd(
 
   let data: Record<string, unknown>;
   try {
-    ({ data } = parseFrontmatter(content));
+    ({ data } = parseFrontmatter(content, options));
   } catch (err) {
     warnSkippedSkill(
       skillMdPath,
@@ -175,7 +175,7 @@ async function findSkillDirs(dir: string, depth = 0, maxDepth = 5): Promise<stri
 }
 
 export interface DiscoverSkillsOptions {
-  /** Override console.warn; diagnostics can include source snippets. */
+  /** Override diagnostic output; messages can include source snippets. */
   onWarning?: (message: string) => void;
   /** Include internal skills (e.g., when user explicitly requests a skill by name) */
   includeInternal?: boolean;

@@ -26,6 +26,74 @@ afterEach(async () => {
 });
 
 describe('per-call skill warnings', () => {
+  it.each(['once', 'always'])(
+    'propagates a parser warning callback that throws %s',
+    async (mode) => {
+      const root = await fixture(
+        '---\nname: tagged\ndescription: !unknown callback-fixture\n---\n'
+      );
+      const failure = new Error('warning callback failed');
+      let calls = 0;
+      const onWarning = vi.fn(() => {
+        calls++;
+        if (mode === 'always' || calls === 1) throw failure;
+      });
+
+      await expect(parseSkillMd(join(root, 'SKILL.md'), { onWarning })).rejects.toBe(failure);
+      expect(onWarning).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining('callback-fixture')
+      );
+    }
+  );
+
+  describe.each([
+    ['root', ''],
+    ['container', 'skills/category/example'],
+    ['recursive', 'other/nested/example'],
+  ])('%s discovery callback failures', (_layout, path) => {
+    it.each([
+      ['native warning', '---\nname: tagged\ndescription: !unknown callback-fixture\n---\n'],
+      ['malformed YAML', malformed('callback-fixture')],
+      ['missing field', '---\nname: missing-description\n---\n'],
+    ])('propagates a %s callback failure unchanged', async (_diagnostic, content) => {
+      const root = await mkdtemp(join(tmpdir(), 'skills-warning-'));
+      roots.push(root);
+      const dir = join(root, path);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, 'SKILL.md'), content);
+      const failure = new Error('warning callback failed');
+      const onWarning = vi.fn(() => {
+        throw failure;
+      });
+
+      await expect(discoverSkills(root, undefined, { onWarning })).rejects.toBe(failure);
+      expect(onWarning).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('propagates an unreadable-file diagnostic callback failure unchanged', async () => {
+    const root = await fixture('unused');
+    const failure = new Error('warning callback failed');
+    const onWarning = vi.fn(() => {
+      throw failure;
+    });
+
+    await expect(parseSkillMd(join(root, 'missing.md'), { onWarning })).rejects.toBe(failure);
+    expect(onWarning).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves native warning order before a parser failure', async () => {
+    const root = await fixture(
+      '---\nname: tagged\ndescription: !unknown callback-fixture\ninvalid: [\n---\n'
+    );
+    const onWarning = vi.fn();
+
+    expect(await parseSkillMd(join(root, 'SKILL.md'), { onWarning })).toBeNull();
+    expect(onWarning).toHaveBeenCalledTimes(2);
+    expect(onWarning.mock.calls[0]![0]).toContain('Unresolved tag:');
+    expect(onWarning.mock.calls[1]![0]).toContain('YAML parse error:');
+  });
+
   it('preserves the default console diagnostic used by CLI discovery', async () => {
     const root = await fixture(malformed('default-fixture-token'));
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});

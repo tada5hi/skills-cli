@@ -8,6 +8,8 @@ import { execFile } from "child_process";
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from "fs/promises";
 import { parse, parseDocument, stringify } from "yaml";
 import { createHash } from "crypto";
+import { createHash as createHash$1 } from "node:crypto";
+import { crc32, gunzipSync, inflateRawSync } from "node:zlib";
 const DEFAULT_GITHUB_HOST = "github.com";
 function getGitHubHost() {
 	const configuredHost = process.env.GH_HOST?.trim();
@@ -920,12 +922,17 @@ async function parseSkillMd(skillMdPath, options) {
 		return null;
 	}
 	let data;
+	const warnings = [];
+	const onWarning = options?.onWarning ? (message) => {
+		warnings.push(message);
+	} : void 0;
 	try {
-		({data} = parseFrontmatter(content, options));
+		({data} = parseFrontmatter(content, { onWarning }));
 	} catch (err) {
-		warnSkippedSkill(skillMdPath, `YAML parse error: ${err.message}`, options?.onWarning);
-		return null;
+		warnSkippedSkill(skillMdPath, `YAML parse error: ${err.message}`, onWarning);
 	}
+	for (const warning of warnings) options?.onWarning?.(warning);
+	if (data === void 0) return null;
 	if (!data.name || !data.description) {
 		const missing = [];
 		if (!data.name) missing.push("name");
@@ -1031,15 +1038,13 @@ async function discoverSkills(basePath, subpath, options) {
 		return true;
 	};
 	const walkSkillDirs = async (dir, maxDepth, depth = 1) => {
-		try {
-			const entries = await readdir(dir, { withFileTypes: true });
-			for (const entry of entries) {
-				if (!entry.isDirectory()) continue;
-				const childDir = join(dir, entry.name);
-				if (await tryAddSkillAt(childDir) || depth >= maxDepth || SKIP_DIRS.includes(entry.name)) continue;
-				await walkSkillDirs(childDir, maxDepth, depth + 1);
-			}
-		} catch {}
+		const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			const childDir = join(dir, entry.name);
+			if (await tryAddSkillAt(childDir) || depth >= maxDepth || SKIP_DIRS.includes(entry.name)) continue;
+			await walkSkillDirs(childDir, maxDepth, depth + 1);
+		}
 	};
 	for (const dir of prioritySearchDirs) await walkSkillDirs(dir, deepContainerDirs.has(dir) ? 3 : 1);
 	if (skills.length === 0 || options?.fullDepth) {
@@ -1832,6 +1837,9 @@ async function detectInstalledAgents() {
 		installed: await config.detectInstalled()
 	})))).filter((r) => r.installed).map((r) => r.type);
 }
+function getAgentConfig(type) {
+	return agents[type];
+}
 const EVE_SUBAGENTS_DIR = join("agent", "subagents");
 function getEveSubagents(cwd = process.cwd()) {
 	const dir = join(cwd, EVE_SUBAGENTS_DIR);
@@ -2151,6 +2159,79 @@ function getCanonicalPath(skillName, options = {}) {
 	const canonicalPath = join(canonicalBase, sanitized);
 	if (!isPathSafe(canonicalBase, canonicalPath)) throw new Error("Invalid skill name: potential path traversal detected");
 	return canonicalPath;
+}
+async function installRemoteSkillForAgent(skill, agentType, options = {}) {
+	const agent = agents[agentType];
+	const isGlobal = options.global ?? false;
+	const cwd = options.cwd || process.cwd();
+	const installMode = options.mode ?? "symlink";
+	const eveSubagent = options.eveSubagent;
+	if (isGlobal && agent.globalSkillsDir === void 0) return {
+		success: false,
+		path: "",
+		mode: installMode,
+		error: `${agent.displayName} does not support global skill installation`
+	};
+	const skillName = sanitizeName(skill.installName);
+	const canonicalBase = agentType === "eve" && installMode === "symlink" ? getAgentBaseDir(agentType, isGlobal, cwd, eveSubagent) : getCanonicalSkillsDir(isGlobal, cwd);
+	const canonicalDir = join(canonicalBase, skillName);
+	const agentBase = getAgentBaseDir(agentType, isGlobal, cwd, eveSubagent);
+	const agentDir = join(agentBase, skillName);
+	if (!isPathSafe(canonicalBase, canonicalDir)) return {
+		success: false,
+		path: agentDir,
+		mode: installMode,
+		error: "Invalid skill name: potential path traversal detected"
+	};
+	if (!isPathSafe(agentBase, agentDir)) return {
+		success: false,
+		path: agentDir,
+		mode: installMode,
+		error: "Invalid skill name: potential path traversal detected"
+	};
+	try {
+		if (installMode === "copy") {
+			await cleanAndCreateDirectory(agentDir);
+			await writeFile(join(agentDir, agentType === "eve" ? toEveFlatSkillFileName(skill.installName) : "SKILL.md"), agentType === "eve" ? stripIgnoredEveFrontmatter(skill.content) : skill.content, "utf-8");
+			return {
+				success: true,
+				path: agentDir,
+				mode: "copy"
+			};
+		}
+		await cleanAndCreateDirectory(canonicalDir);
+		await writeFile(join(canonicalDir, agentType === "eve" ? toEveFlatSkillFileName(skill.installName) : "SKILL.md"), agentType === "eve" ? stripIgnoredEveFrontmatter(skill.content) : skill.content, "utf-8");
+		if (isGlobal && isUniversalAgent(agentType)) return {
+			success: true,
+			path: canonicalDir,
+			canonicalPath: canonicalDir,
+			mode: "symlink"
+		};
+		if (!await createSymlink(canonicalDir, agentDir)) {
+			await cleanAndCreateDirectory(agentDir);
+			await writeFile(join(agentDir, agentType === "eve" ? toEveFlatSkillFileName(skill.installName) : "SKILL.md"), agentType === "eve" ? stripIgnoredEveFrontmatter(skill.content) : skill.content, "utf-8");
+			return {
+				success: true,
+				path: agentDir,
+				canonicalPath: canonicalDir,
+				mode: "symlink",
+				symlinkFailed: true
+			};
+		}
+		return {
+			success: true,
+			path: agentDir,
+			canonicalPath: canonicalDir,
+			mode: "symlink"
+		};
+	} catch (error) {
+		return {
+			success: false,
+			path: agentDir,
+			mode: installMode,
+			error: error instanceof Error ? error.message : "Unknown error"
+		};
+	}
 }
 async function installWellKnownSkillForAgent(skill, agentType, options = {}) {
 	const agent = agents[agentType];
@@ -2484,4 +2565,687 @@ async function listInstalledSkills(options = {}) {
 	} catch {}
 	return Array.from(skillsMap.values());
 }
-export { GitCloneError, InvalidLocalLockError, SKILLS_SH_CONFIG_FILE, addSkillToLocalLock, agents, cleanupTempDir, cloneRepo, computeSkillFolderHash, detectInstalledAgents, discoverSkills, filterSkills, frozenLockfileError, getCanonicalPath, getCanonicalSkillsDir, getEveSubagentSkillsDir, getEveSubagents, getGitHubHost, getGitTreeHash, getInstallPath, getNonUniversalAgents, getOwnerRepo, getSkillDisplayName, getUniversalAgents, getVisibleUniversalAgents, hasSkillMd, installBlobSkillForAgent, installSkillForAgent, installWellKnownSkillForAgent, isRepoPrivate, isSkillInstalled, isUniversalAgent, listInstalledSkills, lockChangeReason, parseFrontmatter, parseOwnerRepo, parseSkillMd, parseSkillsShPaths, parseSource, readLocalLock, removeSkillFromLocalLock, sanitizeMetadata, sanitizeName, shouldInstallInternalSkills, stripTerminalEscapes, writeLocalLock };
+var ProviderRegistryImpl = class {
+	providers = [];
+	register(provider) {
+		if (this.providers.some((p) => p.id === provider.id)) throw new Error(`Provider with id "${provider.id}" already registered`);
+		this.providers.push(provider);
+	}
+	findProvider(url) {
+		for (const provider of this.providers) if (provider.match(url).matches) return provider;
+		return null;
+	}
+	getProviders() {
+		return [...this.providers];
+	}
+};
+const registry = new ProviderRegistryImpl();
+function registerProvider(provider) {
+	registry.register(provider);
+}
+function findProvider(url) {
+	return registry.findProvider(url);
+}
+function getProviders() {
+	return registry.getProviders();
+}
+const ZIP_LOCAL_FILE_HEADER = 67324752;
+const ZIP_CENTRAL_DIRECTORY_HEADER = 33639248;
+const ZIP_END_OF_CENTRAL_DIRECTORY = 101010256;
+const ZIP64_END_OF_CENTRAL_DIRECTORY = 101075792;
+const ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR = 117853008;
+const ZIP_END_MIN_SIZE = 22;
+const ZIP_MAX_COMMENT_SIZE = 65535;
+const CP437_HIGH_BYTES = [
+	"ÇüéâäàåçêëèïîìÄÅ",
+	"ÉæÆôöòûùÿÖÜ¢£¥₧ƒ",
+	"áíóúñÑªº¿⌐¬½¼¡«»",
+	"░▒▓│┤╡╢╖╕╣║╗╝╜╛┐",
+	"└┴┬├─┼╞╟╚╔╩╦╠═╬╧",
+	"╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀",
+	"αßΓπΣσµτΦΘΩδ∞φε∩",
+	"≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\xA0"
+].join("");
+var ArchiveValidationError = class extends Error {
+	constructor(message) {
+		super(message);
+		this.name = "ArchiveValidationError";
+	}
+};
+function ensureRange(buffer, offset, length, label) {
+	if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 || offset + length > buffer.length) throw new Error(`Invalid zip archive: ${label} is out of bounds`);
+}
+function findEndOfCentralDirectory(buffer) {
+	const minOffset = Math.max(0, buffer.length - ZIP_MAX_COMMENT_SIZE - ZIP_END_MIN_SIZE);
+	for (let offset = buffer.length - ZIP_END_MIN_SIZE; offset >= minOffset; offset--) {
+		if (buffer.readUInt32LE(offset) !== ZIP_END_OF_CENTRAL_DIRECTORY) continue;
+		const commentLength = buffer.readUInt16LE(offset + 20);
+		if (offset + ZIP_END_MIN_SIZE + commentLength === buffer.length) return offset;
+	}
+	return -1;
+}
+function readUInt64AsNumber(buffer, offset, label) {
+	ensureRange(buffer, offset, 8, label);
+	const value = buffer.readBigUInt64LE(offset);
+	if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`Invalid zip archive: ${label} exceeds the safe integer range`);
+	return Number(value);
+}
+function readCentralDirectory(buffer, endOffset) {
+	const diskNumber = buffer.readUInt16LE(endOffset + 4);
+	const centralDirectoryDisk = buffer.readUInt16LE(endOffset + 6);
+	const entriesOnDisk = buffer.readUInt16LE(endOffset + 8);
+	const totalEntries = buffer.readUInt16LE(endOffset + 10);
+	const size = buffer.readUInt32LE(endOffset + 12);
+	const offset = buffer.readUInt32LE(endOffset + 16);
+	if (!(entriesOnDisk === 65535 || totalEntries === 65535 || size === 4294967295 || offset === 4294967295)) {
+		if (diskNumber !== 0 || centralDirectoryDisk !== 0 || entriesOnDisk !== totalEntries) throw new Error("Multi-disk zip archives are not supported");
+		return {
+			entries: totalEntries,
+			offset,
+			size,
+			trailerOffset: endOffset
+		};
+	}
+	if (diskNumber !== 0 || centralDirectoryDisk !== 0) throw new Error("Multi-disk zip archives are not supported");
+	const locatorOffset = endOffset - 20;
+	ensureRange(buffer, locatorOffset, 20, "zip64 locator");
+	if (buffer.readUInt32LE(locatorOffset) !== ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR) throw new Error("Invalid zip64 locator");
+	if (buffer.readUInt32LE(locatorOffset + 4) !== 0 || buffer.readUInt32LE(locatorOffset + 16) !== 1) throw new Error("Multi-disk zip archives are not supported");
+	const zip64EndOffset = readUInt64AsNumber(buffer, locatorOffset + 8, "zip64 end offset");
+	ensureRange(buffer, zip64EndOffset, 56, "zip64 end of central directory");
+	if (buffer.readUInt32LE(zip64EndOffset) !== ZIP64_END_OF_CENTRAL_DIRECTORY) throw new Error("Invalid zip64 end of central directory");
+	const recordSize = readUInt64AsNumber(buffer, zip64EndOffset + 4, "zip64 end size");
+	if (recordSize < 44) throw new Error("Invalid zip64 end of central directory");
+	ensureRange(buffer, zip64EndOffset, recordSize + 12, "zip64 end of central directory");
+	if (zip64EndOffset + recordSize + 12 !== locatorOffset) throw new Error("Invalid zip64 end of central directory");
+	if (buffer.readUInt32LE(zip64EndOffset + 16) !== 0 || buffer.readUInt32LE(zip64EndOffset + 20) !== 0) throw new Error("Multi-disk zip archives are not supported");
+	const zip64EntriesOnDisk = readUInt64AsNumber(buffer, zip64EndOffset + 24, "zip64 entries on disk");
+	const zip64TotalEntries = readUInt64AsNumber(buffer, zip64EndOffset + 32, "zip64 total entries");
+	if (zip64EntriesOnDisk !== zip64TotalEntries) throw new Error("Multi-disk zip archives are not supported");
+	return {
+		entries: zip64TotalEntries,
+		size: readUInt64AsNumber(buffer, zip64EndOffset + 40, "zip64 central directory size"),
+		offset: readUInt64AsNumber(buffer, zip64EndOffset + 48, "zip64 central directory offset"),
+		trailerOffset: zip64EndOffset
+	};
+}
+function normalizeArchivePath(rawPath) {
+	if (!rawPath || rawPath.includes("\0")) return null;
+	const path = rawPath.replace(/\\/g, "/");
+	if (path.startsWith("/") || /^[A-Za-z]:/.test(path)) return null;
+	const parts = path.split("/");
+	if (parts.some((part) => part === "..")) return null;
+	const normalized = parts.filter((part) => part && part !== ".").join("/");
+	if (!normalized && !path.endsWith("/")) return null;
+	return path.endsWith("/") && normalized ? `${normalized}/` : normalized;
+}
+function findExtraField(buffer, extraOffset, extraLength, targetId) {
+	const extraEnd = extraOffset + extraLength;
+	let offset = extraOffset;
+	while (offset < extraEnd) {
+		if (offset + 4 > extraEnd) throw new Error("Invalid zip extra field");
+		const id = buffer.readUInt16LE(offset);
+		const size = buffer.readUInt16LE(offset + 2);
+		const dataOffset = offset + 4;
+		ensureRange(buffer, dataOffset, size, "zip extra field");
+		if (dataOffset + size > extraEnd) throw new Error("Invalid zip extra field");
+		if (id === targetId) return buffer.subarray(dataOffset, dataOffset + size);
+		offset = dataOffset + size;
+	}
+	return null;
+}
+function decodeFileName(bytes, isUtf8, unicodePathExtra) {
+	if (isUtf8) return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	if (unicodePathExtra && unicodePathExtra.length >= 5 && unicodePathExtra[0] === 1 && unicodePathExtra.readUInt32LE(1) === crc32(bytes)) return new TextDecoder("utf-8", { fatal: true }).decode(unicodePathExtra.subarray(5));
+	let result = "";
+	for (const byte of bytes) result += byte < 128 ? String.fromCharCode(byte) : CP437_HIGH_BYTES[byte - 128];
+	return result;
+}
+function readZip64EntryValues(buffer, extraOffset, extraLength, values) {
+	if (!(values.uncompressedSize === 4294967295 || values.compressedSize === 4294967295 || values.localHeaderOffset === 4294967295 || values.diskStart === 65535)) {
+		if (values.diskStart !== 0) throw new Error("Multi-disk zip archives are not supported");
+		return values;
+	}
+	const zip64Extra = findExtraField(buffer, extraOffset, extraLength, 1);
+	if (!zip64Extra) throw new Error("Invalid zip64 extra field");
+	let valueOffset = 0;
+	const readNextUInt64 = (label) => {
+		if (valueOffset + 8 > zip64Extra.length) throw new Error(`Invalid zip64 extra field: missing ${label}`);
+		const value = readUInt64AsNumber(zip64Extra, valueOffset, `zip64 ${label}`);
+		valueOffset += 8;
+		return value;
+	};
+	const resolved = { ...values };
+	if (resolved.uncompressedSize === 4294967295) resolved.uncompressedSize = readNextUInt64("uncompressed size");
+	if (resolved.compressedSize === 4294967295) resolved.compressedSize = readNextUInt64("compressed size");
+	if (resolved.localHeaderOffset === 4294967295) resolved.localHeaderOffset = readNextUInt64("local header offset");
+	if (resolved.diskStart === 65535) {
+		if (valueOffset + 4 > zip64Extra.length) throw new Error("Invalid zip64 extra field: missing disk start");
+		resolved.diskStart = zip64Extra.readUInt32LE(valueOffset);
+	}
+	if (resolved.diskStart !== 0) throw new Error("Multi-disk zip archives are not supported");
+	return resolved;
+}
+function readZipArchive(bytes, limits) {
+	const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const endOffset = findEndOfCentralDirectory(buffer);
+	if (endOffset < 0) throw new Error("Invalid zip archive");
+	const centralDirectory = readCentralDirectory(buffer, endOffset);
+	const totalEntries = centralDirectory.entries;
+	if (totalEntries > limits.maxEntries) throw new ArchiveValidationError(`Archive contains too many files (${totalEntries}). Maximum is ${limits.maxEntries}.`);
+	ensureRange(buffer, centralDirectory.offset, centralDirectory.size, "central directory");
+	if (centralDirectory.offset + centralDirectory.size > centralDirectory.trailerOffset) throw new Error("Invalid zip archive: central directory overlaps archive trailer");
+	const files = /* @__PURE__ */ new Map();
+	let extractedBytes = 0;
+	let offset = centralDirectory.offset;
+	for (let index = 0; index < totalEntries; index++) {
+		ensureRange(buffer, offset, 46, "central directory entry");
+		if (buffer.readUInt32LE(offset) !== ZIP_CENTRAL_DIRECTORY_HEADER) throw new Error("Invalid zip central directory entry");
+		const flags = buffer.readUInt16LE(offset + 8);
+		const method = buffer.readUInt16LE(offset + 10);
+		const expectedChecksum = buffer.readUInt32LE(offset + 16);
+		let compressedSize = buffer.readUInt32LE(offset + 20);
+		let uncompressedSize = buffer.readUInt32LE(offset + 24);
+		const fileNameLength = buffer.readUInt16LE(offset + 28);
+		const extraLength = buffer.readUInt16LE(offset + 30);
+		const commentLength = buffer.readUInt16LE(offset + 32);
+		let diskStart = buffer.readUInt16LE(offset + 34);
+		const externalAttributes = buffer.readUInt32LE(offset + 38);
+		let localHeaderOffset = buffer.readUInt32LE(offset + 42);
+		const variableSize = fileNameLength + extraLength + commentLength;
+		ensureRange(buffer, offset + 46, variableSize, "central directory entry data");
+		const nameStart = offset + 46;
+		const extraOffset = nameStart + fileNameLength;
+		({compressedSize, diskStart, localHeaderOffset, uncompressedSize} = readZip64EntryValues(buffer, extraOffset, extraLength, {
+			compressedSize,
+			diskStart,
+			localHeaderOffset,
+			uncompressedSize
+		}));
+		const centralFileName = buffer.subarray(nameStart, nameStart + fileNameLength);
+		const rawFileName = decodeFileName(centralFileName, Boolean(flags & 2048), findExtraField(buffer, extraOffset, extraLength, 28789));
+		const fileName = normalizeArchivePath(rawFileName);
+		if (fileName === null) throw new ArchiveValidationError(`Archive contains unsafe path: ${rawFileName}`);
+		if (flags & 1) throw new ArchiveValidationError("Encrypted zip entries are not supported");
+		const fileType = externalAttributes >>> 16 & 61440;
+		if (fileType !== 0 && fileType !== 32768 && fileType !== 16384) throw new ArchiveValidationError("Archive links are not supported");
+		const isDirectory = rawFileName.replace(/\\/g, "/").endsWith("/") || fileType === 16384;
+		offset += 46 + variableSize;
+		extractedBytes += uncompressedSize;
+		if (extractedBytes > limits.maxExtractedBytes) throw new ArchiveValidationError(`Archive extracts to more than ${limits.maxExtractedBytes} bytes.`);
+		if (isDirectory) continue;
+		ensureRange(buffer, localHeaderOffset, 30, "local file header");
+		if (buffer.readUInt32LE(localHeaderOffset) !== ZIP_LOCAL_FILE_HEADER) throw new Error("Invalid zip local file header");
+		const localFlags = buffer.readUInt16LE(localHeaderOffset + 6);
+		const localMethod = buffer.readUInt16LE(localHeaderOffset + 8);
+		const localFileNameLength = buffer.readUInt16LE(localHeaderOffset + 26);
+		const localExtraLength = buffer.readUInt16LE(localHeaderOffset + 28);
+		const localNameOffset = localHeaderOffset + 30;
+		ensureRange(buffer, localNameOffset, localFileNameLength + localExtraLength, "local file header data");
+		const localFileName = buffer.subarray(localNameOffset, localNameOffset + localFileNameLength);
+		if (localFlags !== flags || localMethod !== method || !localFileName.equals(centralFileName)) throw new Error("Zip local header does not match central directory");
+		const dataOffset = localHeaderOffset + 30 + localFileNameLength + localExtraLength;
+		ensureRange(buffer, dataOffset, compressedSize, "file data");
+		if (dataOffset + compressedSize > centralDirectory.offset) throw new Error("Invalid zip archive: file data overlaps central directory");
+		const compressed = buffer.subarray(dataOffset, dataOffset + compressedSize);
+		let contents;
+		if (method === 0) contents = compressed;
+		else if (method === 8) contents = inflateRawSync(compressed, { maxOutputLength: uncompressedSize + 1 });
+		else throw new Error(`Unsupported zip compression method: ${method}`);
+		if (contents.byteLength !== uncompressedSize) throw new Error("Zip entry size mismatch");
+		if (crc32(contents) !== expectedChecksum) throw new Error("Zip entry checksum mismatch");
+		files.set(fileName, new Uint8Array(contents));
+	}
+	if (offset !== centralDirectory.offset + centralDirectory.size) throw new Error("Invalid zip central directory size");
+	return files;
+}
+const DISCOVERY_SCHEMA_V2 = "https://schemas.agentskills.io/discovery/0.2.0/schema.json";
+const MAX_ARCHIVE_UNPACKED_BYTES = 50 * 1024 * 1024;
+const MAX_ARCHIVE_FILES = 1e3;
+const DISCOVERY_TIMEOUT_MS = 1e4;
+var WellKnownScopeNotFoundError = class extends Error {
+	scopePath;
+	rootUrl;
+	constructor(scopePath, rootUrl) {
+		super(`No skills found for the scoped path '${scopePath}' on ${rootUrl}. Not falling back to the root skills index because that would install every skill the host publishes. Check the URL, or run 'skills add ${rootUrl}' to install from the root index.`);
+		this.name = "WellKnownScopeNotFoundError";
+		this.scopePath = scopePath;
+		this.rootUrl = rootUrl;
+	}
+};
+var WellKnownProvider = class {
+	id = "well-known";
+	displayName = "Well-Known Skills";
+	WELL_KNOWN_PATHS = [".well-known/agent-skills", ".well-known/skills"];
+	INDEX_FILE = "index.json";
+	match(url) {
+		if (!url.startsWith("http://") && !url.startsWith("https://")) return { matches: false };
+		try {
+			const parsed = new URL(url);
+			if ([
+				"github.com",
+				"gitlab.com",
+				"huggingface.co"
+			].includes(parsed.hostname)) return { matches: false };
+			return {
+				matches: true,
+				sourceIdentifier: `wellknown/${parsed.hostname}`
+			};
+		} catch {
+			return { matches: false };
+		}
+	}
+	async fetchIndex(baseUrl, options) {
+		return (await this.fetchIndexCandidates(baseUrl, options))[0] ?? null;
+	}
+	async fetchIndexCandidates(baseUrl, options) {
+		try {
+			const parsed = new URL(baseUrl);
+			const basePath = parsed.pathname.replace(/\/$/, "");
+			const signal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+			const urlsToTry = [];
+			for (const wellKnownPath of this.WELL_KNOWN_PATHS) {
+				urlsToTry.push({
+					indexUrl: `${parsed.protocol}//${parsed.host}${basePath}/${wellKnownPath}/${this.INDEX_FILE}`,
+					baseUrl: `${parsed.protocol}//${parsed.host}${basePath}`,
+					wellKnownPath
+				});
+				if (basePath && basePath !== "") urlsToTry.push({
+					indexUrl: `${parsed.protocol}//${parsed.host}/${wellKnownPath}/${this.INDEX_FILE}`,
+					baseUrl: `${parsed.protocol}//${parsed.host}`,
+					wellKnownPath
+				});
+			}
+			const candidates = [];
+			for (const { indexUrl, baseUrl: resolvedBase, wellKnownPath } of urlsToTry) try {
+				const response = await fetch(indexUrl, {
+					signal,
+					...options?.updateCheck ? { headers: { "X-Skills-Update-Check": "1" } } : {}
+				});
+				if (!response.ok) continue;
+				const rawIndex = await response.json();
+				const normalized = this.normalizeIndex(rawIndex, indexUrl, wellKnownPath);
+				if (!normalized) continue;
+				candidates.push({
+					index: normalized.index,
+					entries: normalized.entries,
+					resolvedBaseUrl: resolvedBase,
+					resolvedWellKnownPath: wellKnownPath,
+					indexUrl
+				});
+			} catch {
+				continue;
+			}
+			return candidates;
+		} catch {
+			return [];
+		}
+	}
+	normalizeIndex(rawIndex, indexUrl, resolvedWellKnownPath) {
+		if (!rawIndex || typeof rawIndex !== "object") return null;
+		const record = rawIndex;
+		if (!Array.isArray(record.skills)) return null;
+		const schema = record.$schema;
+		if (schema === DISCOVERY_SCHEMA_V2) {
+			const entries = [];
+			const v2Entries = [];
+			for (const entry of record.skills) {
+				if (!this.isValidSkillEntryV2(entry)) continue;
+				const artifactUrl = new URL(entry.url, indexUrl).toString();
+				entries.push({
+					version: "0.2.0",
+					name: entry.name,
+					description: entry.description,
+					type: entry.type,
+					artifactUrl,
+					digest: entry.digest,
+					indexEntry: entry
+				});
+				v2Entries.push(entry);
+			}
+			if (entries.length === 0) return null;
+			return {
+				index: {
+					$schema: DISCOVERY_SCHEMA_V2,
+					skills: v2Entries
+				},
+				entries
+			};
+		}
+		if (schema !== void 0) return null;
+		const v1Entries = [];
+		const entries = [];
+		for (const entry of record.skills) {
+			if (!this.isValidSkillEntryV1(entry)) return null;
+			v1Entries.push(entry);
+			entries.push({
+				version: "0.1.0",
+				name: entry.name,
+				description: entry.description,
+				files: entry.files,
+				baseUrl: this.getLegacySkillBaseUrl(indexUrl, resolvedWellKnownPath),
+				wellKnownPath: resolvedWellKnownPath,
+				indexEntry: entry
+			});
+		}
+		return {
+			index: { skills: v1Entries },
+			entries
+		};
+	}
+	getLegacySkillBaseUrl(indexUrl, wellKnownPath) {
+		const parsed = new URL(indexUrl);
+		const marker = `/${wellKnownPath}/${this.INDEX_FILE}`;
+		return `${parsed.protocol}//${parsed.host}${parsed.pathname.slice(0, -marker.length)}`;
+	}
+	isValidSkillName(name) {
+		if (typeof name !== "string") return false;
+		if (name.length < 1 || name.length > 64) return false;
+		if (!/^[a-z0-9-]+$/.test(name)) return false;
+		if (name.startsWith("-") || name.endsWith("-")) return false;
+		if (name.includes("--")) return false;
+		return true;
+	}
+	isSafeLegacyFilePath(filePath) {
+		if (typeof filePath !== "string" || filePath.length === 0) return false;
+		if (filePath.startsWith("/") || filePath.startsWith("\\") || filePath.includes("..")) return false;
+		if (filePath.includes("\0")) return false;
+		return true;
+	}
+	isValidSkillEntryV1(entry) {
+		if (!entry || typeof entry !== "object") return false;
+		const e = entry;
+		if (!this.isValidSkillName(e.name)) return false;
+		if (typeof e.description !== "string" || !e.description) return false;
+		if (!Array.isArray(e.files) || e.files.length === 0) return false;
+		for (const file of e.files) if (!this.isSafeLegacyFilePath(file)) return false;
+		return e.files.some((f) => typeof f === "string" && f.toLowerCase() === "skill.md");
+	}
+	isValidSkillEntryV2(entry) {
+		if (!entry || typeof entry !== "object") return false;
+		const e = entry;
+		if (!this.isValidSkillName(e.name)) return false;
+		if (typeof e.description !== "string" || !e.description || e.description.length > 1024) return false;
+		if (e.type !== "skill-md" && e.type !== "archive") return false;
+		if (typeof e.url !== "string" || !e.url) return false;
+		if (typeof e.digest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(e.digest)) return false;
+		try {
+			new URL(e.url, "https://example.com/.well-known/agent-skills/index.json");
+		} catch {
+			return false;
+		}
+		return true;
+	}
+	async fetchSkill(url) {
+		try {
+			const parsed = new URL(url);
+			const candidates = await this.fetchIndexCandidates(url);
+			for (const result of candidates) {
+				const { entries } = result;
+				let skillName = null;
+				const pathMatch = parsed.pathname.match(/\/.well-known\/(?:agent-skills|skills)\/([^/]+)\/?$/);
+				if (pathMatch && pathMatch[1] && pathMatch[1] !== "index.json") skillName = pathMatch[1];
+				else if (entries.length === 1) skillName = entries[0].name;
+				if (!skillName) continue;
+				const skillEntry = entries.find((s) => s.name === skillName);
+				if (!skillEntry) continue;
+				const skill = await this.fetchSkillByEntry(skillEntry);
+				if (skill) return skill;
+			}
+			return null;
+		} catch {
+			return null;
+		}
+	}
+	async fetchSkillByEntry(baseUrlOrEntry, legacyEntry, legacyWellKnownPath) {
+		if (typeof baseUrlOrEntry === "string") {
+			if (!legacyEntry) return null;
+			return this.fetchLegacySkillByEntry({
+				version: "0.1.0",
+				name: legacyEntry.name,
+				description: legacyEntry.description,
+				files: legacyEntry.files,
+				baseUrl: baseUrlOrEntry,
+				wellKnownPath: legacyWellKnownPath ?? this.WELL_KNOWN_PATHS[0],
+				indexEntry: legacyEntry
+			});
+		}
+		if (baseUrlOrEntry.version === "0.1.0") return this.fetchLegacySkillByEntry(baseUrlOrEntry);
+		return this.fetchArtifactSkillByEntry(baseUrlOrEntry);
+	}
+	async fetchLegacySkillByEntry(entry) {
+		try {
+			const skillBaseUrl = `${entry.baseUrl.replace(/\/$/, "")}/${entry.wellKnownPath}/${entry.name}`;
+			const skillMdUrl = `${skillBaseUrl}/SKILL.md`;
+			const response = await fetch(skillMdUrl);
+			if (!response.ok) return null;
+			const content = await response.text();
+			const { data } = parseFrontmatter(content);
+			if (typeof data.name !== "string" || typeof data.description !== "string") return null;
+			const files = /* @__PURE__ */ new Map();
+			files.set("SKILL.md", content);
+			const filePromises = entry.files.filter((f) => f.toLowerCase() !== "skill.md").map(async (filePath) => {
+				try {
+					const fileUrl = `${skillBaseUrl}/${filePath}`;
+					const fileResponse = await fetch(fileUrl);
+					if (fileResponse.ok) {
+						const fileContent = await fileResponse.arrayBuffer();
+						return {
+							path: filePath,
+							content: new Uint8Array(fileContent)
+						};
+					}
+				} catch {}
+				return null;
+			});
+			const fileResults = await Promise.all(filePromises);
+			for (const result of fileResults) if (result) files.set(result.path, result.content);
+			return this.createSkill({
+				name: data.name,
+				description: data.description,
+				content,
+				installName: entry.name,
+				sourceUrl: skillMdUrl,
+				metadata: data.metadata,
+				files,
+				indexEntry: entry.indexEntry
+			});
+		} catch {
+			return null;
+		}
+	}
+	async fetchArtifactSkillByEntry(entry) {
+		try {
+			const response = await fetch(entry.artifactUrl);
+			if (!response.ok) return null;
+			const contentType = response.headers.get("content-type") ?? "";
+			const bytes = new Uint8Array(await response.arrayBuffer());
+			if (this.computeDigest(bytes) !== entry.digest) return null;
+			if (entry.type === "skill-md") {
+				const content = new TextDecoder().decode(bytes);
+				const { data } = parseFrontmatter(content);
+				if (typeof data.name !== "string" || typeof data.description !== "string") return null;
+				const files = /* @__PURE__ */ new Map();
+				files.set("SKILL.md", content);
+				return this.createSkill({
+					name: data.name,
+					description: data.description,
+					content,
+					installName: entry.name,
+					sourceUrl: entry.artifactUrl,
+					metadata: data.metadata,
+					files,
+					indexEntry: entry.indexEntry
+				});
+			}
+			const files = this.extractArchive(bytes, entry.artifactUrl, contentType);
+			const skillMdBytes = files.get("SKILL.md");
+			if (!skillMdBytes) return null;
+			const content = typeof skillMdBytes === "string" ? skillMdBytes : new TextDecoder().decode(skillMdBytes);
+			files.set("SKILL.md", content);
+			const { data } = parseFrontmatter(content);
+			if (typeof data.name !== "string" || typeof data.description !== "string") return null;
+			return this.createSkill({
+				name: data.name,
+				description: data.description,
+				content,
+				installName: entry.name,
+				sourceUrl: entry.artifactUrl,
+				metadata: data.metadata,
+				files,
+				indexEntry: entry.indexEntry
+			});
+		} catch {
+			return null;
+		}
+	}
+	createSkill(input) {
+		return {
+			name: sanitizeMetadata(input.name),
+			description: sanitizeMetadata(input.description),
+			content: input.content,
+			installName: input.installName,
+			sourceUrl: input.sourceUrl,
+			metadata: input.metadata && typeof input.metadata === "object" ? input.metadata : void 0,
+			files: input.files,
+			indexEntry: input.indexEntry
+		};
+	}
+	getScope(url) {
+		try {
+			const parsed = new URL(url);
+			const scopePath = parsed.pathname.replace(/\/$/, "");
+			if (!scopePath) return null;
+			return {
+				scopePath,
+				rootBaseUrl: `${parsed.protocol}//${parsed.host}`
+			};
+		} catch {
+			return null;
+		}
+	}
+	async fetchAllSkills(url, options = {}) {
+		try {
+			const candidates = await this.fetchIndexCandidates(url);
+			const scope = this.getScope(url);
+			const scopedCandidates = scope ? candidates.filter((c) => c.resolvedBaseUrl !== scope.rootBaseUrl) : candidates;
+			const includeInternal = options.includeInternal || shouldInstallInternalSkills();
+			for (const result of scopedCandidates) {
+				const skillPromises = result.entries.map((entry) => this.fetchSkillByEntry(entry));
+				const skills = (await Promise.all(skillPromises)).filter((s) => s !== null).filter((skill) => includeInternal || skill.metadata?.internal !== true);
+				if (skills.length > 0) return skills;
+			}
+			if (scope && scopedCandidates.length < candidates.length) throw new WellKnownScopeNotFoundError(scope.scopePath, scope.rootBaseUrl);
+			return [];
+		} catch (error) {
+			if (error instanceof WellKnownScopeNotFoundError) throw error;
+			return [];
+		}
+	}
+	computeDigest(bytes) {
+		return `sha256:${createHash$1("sha256").update(bytes).digest("hex")}`;
+	}
+	extractArchive(bytes, artifactUrl, contentType) {
+		if (this.isZipArchive(bytes, artifactUrl, contentType)) return new Map(readZipArchive(bytes, {
+			maxExtractedBytes: MAX_ARCHIVE_UNPACKED_BYTES,
+			maxEntries: MAX_ARCHIVE_FILES
+		}));
+		if (this.isTarGzArchive(bytes, artifactUrl, contentType)) return this.extractTarGz(bytes);
+		throw new Error("Unsupported archive format");
+	}
+	isZipArchive(bytes, artifactUrl, contentType) {
+		return contentType.includes("application/zip") || artifactUrl.toLowerCase().endsWith(".zip") || bytes[0] === 80 && bytes[1] === 75;
+	}
+	isTarGzArchive(bytes, artifactUrl, contentType) {
+		const lower = artifactUrl.toLowerCase();
+		return contentType.includes("application/gzip") || contentType.includes("application/x-gzip") || lower.endsWith(".tar.gz") || lower.endsWith(".tgz") || bytes[0] === 31 && bytes[1] === 139;
+	}
+	normalizeArchivePath(rawPath) {
+		if (!rawPath || rawPath.includes("\0")) return null;
+		if (rawPath.startsWith("/") || rawPath.startsWith("\\")) return null;
+		if (/^[A-Za-z]:/.test(rawPath)) return null;
+		if (rawPath.includes("\\")) return null;
+		const parts = rawPath.split("/").filter(Boolean);
+		if (parts.length === 0) return null;
+		if (parts.some((part) => part === "." || part === "..")) return null;
+		return parts.join("/");
+	}
+	addArchiveFile(files, path, content, runningTotal) {
+		const normalizedPath = this.normalizeArchivePath(path);
+		if (!normalizedPath) throw new Error(`Unsafe archive path: ${path}`);
+		runningTotal.bytes += content.byteLength;
+		if (runningTotal.bytes > MAX_ARCHIVE_UNPACKED_BYTES) throw new Error("Archive exceeds maximum unpacked size");
+		if (files.size >= MAX_ARCHIVE_FILES) throw new Error("Archive contains too many files");
+		files.set(normalizedPath, content);
+	}
+	extractTarGz(bytes) {
+		const tar = gunzipSync(Buffer.from(bytes));
+		const files = /* @__PURE__ */ new Map();
+		const runningTotal = { bytes: 0 };
+		let offset = 0;
+		while (offset + 512 <= tar.length) {
+			const header = tar.subarray(offset, offset + 512);
+			if (header.every((byte) => byte === 0)) break;
+			const name = this.readTarString(header, 0, 100);
+			const sizeText = this.readTarString(header, 124, 12).trim();
+			const typeFlag = header[156];
+			const prefix = this.readTarString(header, 345, 155);
+			const path = prefix ? `${prefix}/${name}` : name;
+			const size = Number.parseInt(sizeText || "0", 8);
+			if (!Number.isFinite(size) || size < 0) throw new Error("Invalid tar entry size");
+			offset += 512;
+			if (typeFlag === 50 || typeFlag === 49) throw new Error("Archive links are not supported");
+			if (typeFlag === 0 || typeFlag === 48) {
+				const content = tar.subarray(offset, offset + size);
+				this.addArchiveFile(files, path, new Uint8Array(content), runningTotal);
+			}
+			offset += Math.ceil(size / 512) * 512;
+		}
+		if (!files.has("SKILL.md")) throw new Error("Archive missing root SKILL.md");
+		return files;
+	}
+	readTarString(buffer, offset, length) {
+		const slice = buffer.subarray(offset, offset + length);
+		const nul = slice.indexOf(0);
+		return new TextDecoder().decode(nul >= 0 ? slice.subarray(0, nul) : slice);
+	}
+	toRawUrl(url) {
+		try {
+			const parsed = new URL(url);
+			if (url.toLowerCase().endsWith("/skill.md")) return url;
+			const primaryPath = this.WELL_KNOWN_PATHS[0];
+			const pathMatch = parsed.pathname.match(/\/.well-known\/(?:agent-skills|skills)\/([^/]+)\/?$/);
+			if (pathMatch && pathMatch[1]) {
+				const basePath = parsed.pathname.replace(/\/.well-known\/(?:agent-skills|skills)\/.*$/, "");
+				return `${parsed.protocol}//${parsed.host}${basePath}/${primaryPath}/${pathMatch[1]}/SKILL.md`;
+			}
+			const basePath = parsed.pathname.replace(/\/$/, "");
+			return `${parsed.protocol}//${parsed.host}${basePath}/${primaryPath}/${this.INDEX_FILE}`;
+		} catch {
+			return url;
+		}
+	}
+	getSourceIdentifier(url) {
+		try {
+			return new URL(url).hostname.replace(/^www\./, "");
+		} catch {
+			return "unknown";
+		}
+	}
+	async hasSkillsIndex(url) {
+		return await this.fetchIndex(url) !== null;
+	}
+};
+function computeWellKnownSkillDigest(skill) {
+	if ("digest" in skill.indexEntry && skill.indexEntry.digest) return skill.indexEntry.digest;
+	const hash = createHash$1("sha256");
+	for (const path of Array.from(skill.files.keys()).sort()) {
+		hash.update(path);
+		hash.update("\0");
+		hash.update(skill.files.get(path));
+		hash.update("\0");
+	}
+	return `sha256:${hash.digest("hex")}`;
+}
+const wellKnownProvider = new WellKnownProvider();
+export { ArchiveValidationError, EVE_SUBAGENTS_DIR, GitCloneError, InvalidLocalLockError, SKILLS_SH_CONFIG_FILE, WellKnownProvider, WellKnownScopeNotFoundError, addSkillToLocalLock, agents, cleanupTempDir, cloneRepo, computeSkillFolderHash, computeWellKnownSkillDigest, detectInstalledAgents, discoverSkills, filterSkills, findProvider, frozenLockfileError, getAgentBaseDir, getAgentConfig, getCanonicalPath, getCanonicalSkillsDir, getEveSubagentSkillsDir, getEveSubagents, getGitHubHost, getGitTreeHash, getInstallPath, getNonUniversalAgents, getOpenClawGlobalSkillsDir, getOwnerRepo, getPluginGroupings, getPluginSkillPaths, getProviders, getSkillDisplayName, getUniversalAgents, getVisibleUniversalAgents, hasSkillMd, installBlobSkillForAgent, installRemoteSkillForAgent, installSkillForAgent, installWellKnownSkillForAgent, isCommitSha, isGitHubHttpsCloneUrl, isGitHubSsoAuthError, isKimchiInstalled, isMiniMaxCodeInstalled, isMissingRefError, isPositAssistantInstalled, isRepoPrivate, isSkillInstalled, isSubpathSafe, isUniversalAgent, isZCodeInstalled, listInstalledSkills, lockChangeReason, parseFrontmatter, parseGitHubRepoUrl, parseOwnerRepo, parseSkillMd, parseSkillsShPaths, parseSource, readLocalLock, readZipArchive, registerProvider, registry, removeSkillFromLocalLock, sanitizeMetadata, sanitizeName, sanitizeSubpath, shouldInstallInternalSkills, stripTerminalEscapes, wellKnownProvider, writeLocalLock };

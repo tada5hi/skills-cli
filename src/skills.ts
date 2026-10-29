@@ -98,17 +98,20 @@ export async function parseSkillMd(
     return null;
   }
 
-  let data: Record<string, unknown>;
+  let data: Record<string, unknown> | undefined;
+  const warnings: string[] = [];
+  const onWarning = options?.onWarning
+    ? (message: string) => {
+        warnings.push(message);
+      }
+    : undefined;
   try {
-    ({ data } = parseFrontmatter(content, options));
+    ({ data } = parseFrontmatter(content, { onWarning }));
   } catch (err) {
-    warnSkippedSkill(
-      skillMdPath,
-      `YAML parse error: ${(err as Error).message}`,
-      options?.onWarning
-    );
-    return null;
+    warnSkippedSkill(skillMdPath, `YAML parse error: ${(err as Error).message}`, onWarning);
   }
+  for (const warning of warnings) options?.onWarning?.(warning);
+  if (data === undefined) return null;
 
   if (!data.name || !data.description) {
     const missing: string[] = [];
@@ -319,23 +322,19 @@ export async function discoverSkills(
   };
 
   const walkSkillDirs = async (dir: string, maxDepth: number, depth = 1): Promise<void> => {
-    try {
-      const entries = await readdir(dir, { withFileTypes: true });
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
 
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
 
-        const childDir = join(dir, entry.name);
-        const foundAtChild = await tryAddSkillAt(childDir);
+      const childDir = join(dir, entry.name);
+      const foundAtChild = await tryAddSkillAt(childDir);
 
-        // Preserve flat-layout semantics by stopping below a discovered
-        // skill, and never descend through ignored directories.
-        if (foundAtChild || depth >= maxDepth || SKIP_DIRS.includes(entry.name)) continue;
+      // Preserve flat-layout semantics by stopping below a discovered
+      // skill, and never descend through ignored directories.
+      if (foundAtChild || depth >= maxDepth || SKIP_DIRS.includes(entry.name)) continue;
 
-        await walkSkillDirs(childDir, maxDepth, depth + 1);
-      }
-    } catch {
-      // Directory doesn't exist or is unreadable; skip silently.
+      await walkSkillDirs(childDir, maxDepth, depth + 1);
     }
   };
 

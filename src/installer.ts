@@ -37,7 +37,7 @@ import { parseSkillMd } from './skills.ts';
  */
 export type InstallMode = 'symlink' | 'copy' | 'link';
 
-interface InstallOptions {
+export interface InstallOptions {
   global?: boolean;
   cwd?: string;
   mode?: InstallMode;
@@ -46,7 +46,7 @@ interface InstallOptions {
   createMissingAgentRoot?: boolean;
 }
 
-interface InstallResult {
+export interface InstallResult {
   success: boolean;
   path: string;
   canonicalPath?: string;

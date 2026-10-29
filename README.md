@@ -17,6 +17,44 @@ Supports **OpenCode**, **Claude Code**, **Codex**, **Cursor**, and [75 more](doc
   <a href="https://skills.sh/vercel-labs/skills"><img alt="skills.sh" src="https://skills.sh/b/vercel-labs/skills?style=for-the-badge" height="28"></a>
 </p>
 
+## Temporary headless SDK fork
+
+This fork exposes the existing discovery and installation functions for preparation tools.
+Use Node.js 22.20 or later and pin the dependency to a full reviewed commit:
+
+```json
+{
+  "devDependencies": {
+    "skills": "git+https://github.com/tada5hi/skills-cli.git#<full-commit-sha>"
+  }
+}
+```
+
+The pinned fork includes generated `dist` files and needs no install-time build scripts.
+It exports `parseSource`, `cloneRepo`, `cleanupTempDir`, `discoverSkills`, `filterSkills`
+and `installSkillForAgent`, plus their existing TypeScript types. Importing the root
+entry does not run the CLI or start telemetry.
+
+```ts
+import { discoverSkills, filterSkills, installSkillForAgent } from 'skills';
+
+const skills = await discoverSkills('/absolute/path/to/source');
+const selected = filterSkills(skills, ['my-skill']);
+for (const skill of selected) {
+  const result = await installSkillForAgent(skill, 'universal', {
+    cwd: '/absolute/path/to/project',
+    global: false,
+    mode: 'copy',
+  });
+  if (!result.success) throw new Error(result.error);
+}
+```
+
+These are upstream implementations with their existing behavior: callers must validate
+requested names, inspect install results and clean cloned repositories with `cleanupTempDir`.
+The CLI remains available. Migration to an official SDK release is tracked in
+[agents-dev issue 13](https://github.com/tada5hi/agents-dev/issues/13).
+
 ## Install a Skill
 
 Requires Node.js 22.20 or later. Run this from your project:
